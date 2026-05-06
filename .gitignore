@@ -35,6 +35,8 @@ secrets.json
 # Phase 1 launch artifacts (per-machine, ephemeral)
 /infra/sunshine-node/.last-instance-id
 /infra/sunshine-node/.last-public-ip
+/infra/sunshine-node/.last-launch.env
+/infra/sunshine-node/.last-az
 
 # IDE / OS
 .DS_Store

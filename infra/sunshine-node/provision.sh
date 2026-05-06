@@ -30,18 +30,28 @@ apt-get install -y \
   xorg xserver-xorg-core xserver-xorg-video-dummy x11-xserver-utils \
   mesa-utils pulseaudio pulseaudio-utils \
   curl wget jq ca-certificates \
-  docker.io
+  xfce4 xfce4-terminal dbus-x11
+
+# Docker: DLAMI usually ships docker-ce + containerd.io. If absent, install docker-ce.
+if ! command -v docker >/dev/null; then
+  log "Installing docker-ce"
+  apt-get install -y docker-ce docker-ce-cli containerd.io || apt-get install -y docker.io
+fi
+systemctl enable --now docker || true
 
 # ---------------------------------------------------------------------------
 # 2. NVIDIA driver sanity check (DLAMI ships drivers preinstalled).
 # ---------------------------------------------------------------------------
 nvidia-smi --query-gpu=name,driver_version --format=csv
 
-GPU_BUS_ID=$(nvidia-xconfig --query-gpu-info \
-  | awk '/PCI BusID/ {gsub(":", " ", $4); printf "PCI:%d:%d:%d", strtonum("0x"$4), strtonum("0x"$5), strtonum("0x"$6); exit}')
-# Fallback parser if the above is empty.
-if [ -z "${GPU_BUS_ID}" ]; then
-  GPU_BUS_ID=$(nvidia-xconfig --query-gpu-info | grep "PCI BusID" | head -1 | awk '{print $4}')
+GPU_INFO=$(nvidia-xconfig --query-gpu-info)
+# Output line looks like:  "PCI BusID : PCI:0:30:0"  — already in the format
+# Xorg expects (decimal bus:device:function). Take it verbatim.
+GPU_BUS_ID=$(echo "${GPU_INFO}" | grep -oE 'PCI:[0-9]+:[0-9]+:[0-9]+' | head -1)
+if [ -z "${GPU_BUS_ID}" ] || [[ ! "${GPU_BUS_ID}" =~ ^PCI: ]]; then
+  log "ERROR: failed to parse PCI BusID from nvidia-xconfig. Full output:"
+  echo "${GPU_INFO}" >&2
+  exit 1
 fi
 log "GPU BusID: ${GPU_BUS_ID}"
 
@@ -59,12 +69,22 @@ if ! pgrep -x Xorg >/dev/null; then
   systemctl stop gdm3 lightdm 2>/dev/null || true
   nohup Xorg :0 -config /etc/X11/xorg.conf -noreset \
     > /var/log/xorg-sunshine.log 2>&1 &
-  sleep 4
 fi
 
-if ! DISPLAY=:0 glxinfo 2>/dev/null | grep -q "OpenGL renderer.*NVIDIA"; then
-  log "ERROR: Xorg did not come up with the NVIDIA renderer."
+# Poll for Xorg + NVIDIA renderer for up to 30s.
+xorg_ready=0
+for _ in $(seq 1 15); do
+  GLX_OUT=$(DISPLAY=:0 glxinfo 2>/dev/null || true)
+  if echo "${GLX_OUT}" | grep -qE "(server glx vendor string: NVIDIA|OpenGL vendor string: NVIDIA|OpenGL renderer.*(NVIDIA|Tesla|GeForce|Quadro|RTX|GRID))"; then
+    xorg_ready=1
+    break
+  fi
+  sleep 2
+done
+if [ "${xorg_ready}" -ne 1 ]; then
+  log "ERROR: Xorg did not come up with the NVIDIA renderer within 30s."
   log "Check /var/log/xorg-sunshine.log and the BusID above."
+  tail -50 /var/log/xorg-sunshine.log >&2 || true
   exit 1
 fi
 log "Xorg up; NVIDIA renderer active on :0."
@@ -79,9 +99,41 @@ if ! command -v sunshine >/dev/null; then
   apt-get install -y /tmp/sunshine.deb
 fi
 
+# The Sunshine 22.04 deb is built against newer libstdc++ than Ubuntu 22.04 ships.
+# Pull GCC 13 runtime from the toolchain PPA to satisfy GLIBCXX_3.4.32.
+if ! strings /lib/x86_64-linux-gnu/libstdc++.so.6 2>/dev/null | grep -q "GLIBCXX_3.4.32"; then
+  log "Upgrading libstdc++6 from ubuntu-toolchain-r/test PPA"
+  add-apt-repository -y ppa:ubuntu-toolchain-r/test
+  apt-get update -y
+  apt-get install -y --only-upgrade libstdc++6
+fi
+
 # Drop our config into the ubuntu user's home.
 install -d -o ubuntu -g ubuntu /home/ubuntu/.config/sunshine
 install -o ubuntu -g ubuntu -m 0644 sunshine.conf /home/ubuntu/.config/sunshine/sunshine.conf
+
+# ---------------------------------------------------------------------------
+# 4b. XFCE desktop so Sunshine has something to capture.
+# ---------------------------------------------------------------------------
+cat >/etc/systemd/system/xfce-session.service <<'EOF'
+[Unit]
+Description=XFCE desktop session for Sunshine capture
+After=network-online.target
+Requires=network-online.target
+
+[Service]
+User=ubuntu
+Environment=DISPLAY=:0
+ExecStart=/usr/bin/dbus-launch --exit-with-session /usr/bin/xfce4-session
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+systemctl enable --now xfce-session
+sleep 2
 
 # ---------------------------------------------------------------------------
 # 5. Run Sunshine under a systemd unit (system-level, runs as ubuntu user).
