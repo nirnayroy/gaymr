@@ -1,0 +1,4 @@
+DROP TABLE IF EXISTS gpu_skus;
+DROP TABLE IF EXISTS sessions;
+DROP TYPE IF EXISTS session_status;
+DROP TABLE IF EXISTS users;
