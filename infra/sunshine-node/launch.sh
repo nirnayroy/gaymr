@@ -17,6 +17,9 @@ KEYPAIR="${KEYPAIR:-gaymr-sunshine-mumbai}"
 AMI_PARAM="/aws/service/deeplearning/ami/x86_64/base-oss-nvidia-driver-gpu-ubuntu-22.04/latest/ami-id"
 NAME_TAG="${NAME_TAG:-gaymr-sunshine-step1}"
 SG_NAME="${SG_NAME:-gaymr-sunshine-sg}"
+# On-demand G/VT quota is 0 in ap-south-1; Spot quota is 4 vCPU. Default to spot
+# for Phase 1. Set USE_SPOT=0 once on-demand quota is granted.
+USE_SPOT="${USE_SPOT:-1}"
 
 # ---------------------------------------------------------------------------
 # Resolve the latest DLAMI Ubuntu 22.04 OSS NVIDIA AMI.
@@ -82,14 +85,24 @@ echo "[launch] SG: $SG_ID"
 # ---------------------------------------------------------------------------
 # Launch.
 # ---------------------------------------------------------------------------
-INSTANCE_ID=$(aws ec2 run-instances --region "$REGION" \
-  --image-id "$AMI_ID" \
-  --instance-type "$INSTANCE_TYPE" \
-  --key-name "$KEYPAIR" \
-  --security-group-ids "$SG_ID" \
-  --block-device-mappings 'DeviceName=/dev/sda1,Ebs={VolumeSize=50,VolumeType=gp3,DeleteOnTermination=true}' \
-  --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=${NAME_TAG}},{Key=project,Value=gaymr},{Key=step,Value=1}]" \
-  --instance-initiated-shutdown-behavior terminate \
+RUN_ARGS=(
+  --region "$REGION"
+  --image-id "$AMI_ID"
+  --instance-type "$INSTANCE_TYPE"
+  --key-name "$KEYPAIR"
+  --security-group-ids "$SG_ID"
+  --block-device-mappings 'DeviceName=/dev/sda1,Ebs={VolumeSize=100,VolumeType=gp3,DeleteOnTermination=true}'
+  --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=${NAME_TAG}},{Key=project,Value=gaymr},{Key=step,Value=1}]"
+)
+if [ "${USE_SPOT}" = "1" ]; then
+  echo "[launch] Mode: SPOT (one-time, terminate on interruption)"
+  RUN_ARGS+=(--instance-market-options 'MarketType=spot,SpotOptions={SpotInstanceType=one-time,InstanceInterruptionBehavior=terminate}')
+else
+  echo "[launch] Mode: ON-DEMAND"
+  RUN_ARGS+=(--instance-initiated-shutdown-behavior terminate)
+fi
+
+INSTANCE_ID=$(aws ec2 run-instances "${RUN_ARGS[@]}" \
   --query 'Instances[0].InstanceId' --output text)
 
 echo "[launch] Instance: $INSTANCE_ID"
@@ -117,3 +130,12 @@ EOF
 # Persist the active instance for downstream scripts.
 echo "$INSTANCE_ID" > .last-instance-id
 echo "$PUBLIC_IP"   > .last-public-ip
+cat > .last-launch.env <<EOF
+INSTANCE_ID=${INSTANCE_ID}
+PUBLIC_IP=${PUBLIC_IP}
+AMI_ID=${AMI_ID}
+INSTANCE_TYPE=${INSTANCE_TYPE}
+REGION=${REGION}
+USE_SPOT=${USE_SPOT}
+LAUNCHED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+EOF
