@@ -11,6 +11,8 @@ from pathlib import Path
 import aws_cdk as cdk
 from aws_cdk import (
     aws_athena as athena,
+    aws_cloudwatch as cloudwatch,
+    aws_cloudwatch_actions as cw_actions,
     aws_dynamodb as dynamodb,
     aws_events as events,
     aws_events_targets as targets,
@@ -19,9 +21,14 @@ from aws_cdk import (
     aws_lambda as _lambda,
     aws_s3 as s3,
     aws_s3_notifications as s3n,
+    aws_sns as sns,
+    aws_sns_subscriptions as subs,
     aws_ssm as ssm,
 )
 from constructs import Construct
+
+ALERT_EMAIL = "nroy1012@gmail.com"
+METRIC_NAMESPACE = "cricdata"
 
 CRICDATA_ROOT = Path(__file__).resolve().parents[2]
 
@@ -214,11 +221,66 @@ class CricdataStack(cdk.Stack):
                 "QUOTA_TABLE": quota_table.table_name,
                 "RAW_BUCKET": raw.bucket_name,
                 "RAW_PREFIX": "raw/cricdata",
+                "METRIC_NAMESPACE": METRIC_NAMESPACE,
             },
         )
         api_key_param.grant_read(poller_fn)
         quota_table.grant_read_write_data(poller_fn)
         raw.grant_put(poller_fn)
+        poller_fn.add_to_role_policy(iam.PolicyStatement(
+            actions=["cloudwatch:PutMetricData"],
+            resources=["*"],
+            conditions={"StringEquals": {"cloudwatch:namespace": METRIC_NAMESPACE}},
+        ))
+
+        # --- Alerting ---------------------------------------------------
+        alarm_topic = sns.Topic(self, "CricdataAlerts", display_name="cricdata alerts")
+        alarm_topic.add_subscription(subs.EmailSubscription(ALERT_EMAIL))
+        alarm_action = cw_actions.SnsAction(alarm_topic)
+
+        # 1. Quota approaching limit (PutMetricData is per-invocation, alarm
+        #    fires the moment the daily counter crosses 90).
+        cloudwatch.Alarm(
+            self, "QuotaHitsHigh",
+            alarm_description="cricdata daily API hits >= 90 (limit 100, fail-closed at 95)",
+            metric=cloudwatch.Metric(
+                namespace=METRIC_NAMESPACE,
+                metric_name="QuotaHits",
+                statistic="Maximum",
+                period=cdk.Duration.minutes(5),
+            ),
+            threshold=90,
+            evaluation_periods=1,
+            comparison_operator=cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+            treat_missing_data=cloudwatch.TreatMissingData.NOT_BREACHING,
+        ).add_alarm_action(alarm_action)
+
+        # 2. Any poller error (uncaught exception -> Lambda Errors metric)
+        cloudwatch.Alarm(
+            self, "PollerErrors",
+            alarm_description="cricdata poller Lambda raised an unhandled exception",
+            metric=poller_fn.metric_errors(period=cdk.Duration.minutes(5)),
+            threshold=1,
+            evaluation_periods=1,
+            comparison_operator=cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+            treat_missing_data=cloudwatch.TreatMissingData.NOT_BREACHING,
+        ).add_alarm_action(alarm_action)
+
+        # 3. Quota guard firing repeatedly = schedule is too aggressive
+        cloudwatch.Alarm(
+            self, "QuotaExceededFrequent",
+            alarm_description="cricdata quota guard rejected >5 calls in 24h — schedule too aggressive",
+            metric=cloudwatch.Metric(
+                namespace=METRIC_NAMESPACE,
+                metric_name="QuotaExceeded",
+                statistic="Sum",
+                period=cdk.Duration.hours(24),
+            ),
+            threshold=5,
+            evaluation_periods=1,
+            comparison_operator=cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
+            treat_missing_data=cloudwatch.TreatMissingData.NOT_BREACHING,
+        ).add_alarm_action(alarm_action)
 
         # Schedule created DISABLED — Phase 3 enables after fault-injection test
         events.Rule(
@@ -234,3 +296,5 @@ class CricdataStack(cdk.Stack):
         cdk.CfnOutput(self, "CuratedBucketName", value=curated.bucket_name)
         cdk.CfnOutput(self, "QuotaTableName", value=quota_table.table_name)
         cdk.CfnOutput(self, "AthenaWorkgroup", value="cricdata")
+        cdk.CfnOutput(self, "AlertTopicArn", value=alarm_topic.topic_arn)
+        cdk.CfnOutput(self, "PollerFnName", value=poller_fn.function_name)
